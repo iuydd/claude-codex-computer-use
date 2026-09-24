@@ -14,6 +14,10 @@ import uuid
 from bridge import tr
 
 
+class RuntimeNotFoundError(ValueError):
+    """No valid installed runtime manifest was discovered."""
+
+
 def managed_path(home):
     return Path(home) / '.claude/mcp-servers/claude-codex-computer-use/bridge.py'
 
@@ -25,30 +29,38 @@ def owned(server, home):
     paths = {str(managed_path(home)), str(Path(home) / '.claude/mcp-servers/cua-repl-bridge/bridge.py')}
     return (isinstance(args, list) and len(args) >= 4 and all(isinstance(arg, str) for arg in args) and args[0] == '-B'
             and args[1] in paths and isinstance(server.get('command'), str)
-            and re.fullmatch(r'python(?:\d+(?:\.\d+)*)?', Path(server['command']).name) is not None)
+            and re.fullmatch(r'python(?:\d+(?:\.\d+)*)?(?:\.exe)?', Path(server['command']).name, re.IGNORECASE) is not None)
 
 
 def discover(home):
-    root = Path(home) / '.codex/plugins/cache/openai-bundled/unified-computer-use'
+    codex_home = Path(os.environ.get('CODEX_HOME') or Path(home) / '.codex')
+    root = codex_home / 'plugins/cache/openai-bundled/unified-computer-use'
     candidates = sorted(root.glob('*/.mcp.json'), key=lambda p: p.parent.stat().st_mtime, reverse=True)
     for source in candidates:
         try:
-            server = json.loads(source.read_text())['mcpServers']['cua_repl']
+            server = json.loads(source.read_text(encoding='utf-8'))['mcpServers']['cua_repl']
             command, args = server['command'], server['args']
             if not isinstance(command, str) or not isinstance(args, list) or not args:
                 continue
-            if not all(isinstance(p, str) and Path(p).is_absolute() and Path(p).is_file() for p in [command, *args]):
+            if not Path(command).is_absolute() or not Path(command).is_file():
+                continue
+            if not all(isinstance(arg, str) and arg for arg in args):
+                continue
+            if any(Path(arg).is_absolute() and not Path(arg).exists() for arg in args):
                 continue
             env = server.get('env', {})
             if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
                 continue
-            for key in ('SKY_CUA_SERVICE_PATH', 'CODEX_CLI_PATH', 'CUA_REPL_NODE_REPL_PATH'):
-                if key not in env or not Path(env[key]).exists():
+            required_paths = ['CODEX_CLI_PATH', 'CUA_REPL_NODE_REPL_PATH']
+            if sys.platform != 'win32':
+                required_paths.append('SKY_CUA_SERVICE_PATH')
+            for key in required_paths:
+                if key not in env or not Path(env[key]).is_absolute() or not Path(env[key]).exists():
                     raise ValueError('Missing runtime')
             return source, copy.deepcopy(server)
         except (OSError, ValueError, KeyError, TypeError):
             continue
-    raise ValueError(tr('No usable Codex computer-use runtime found. Install/enable the Codex computer-use plugin first.', '未找到可用的 Codex Computer Use runtime。请先安装或启用 Codex Computer Use 插件。', '找不到可用的 Codex Computer Use runtime。請先安裝或啟用 Codex Computer Use 外掛。', '使用可能な Codex Computer Use runtime が見つかりません。先に Codex Computer Use プラグインをインストールまたは有効化してください。'))
+    raise RuntimeNotFoundError(tr('No usable Codex computer-use runtime found. Install/enable the Codex computer-use plugin first.', '未找到可用的 Codex Computer Use runtime。请先安装或启用 Codex Computer Use 插件。', '找不到可用的 Codex Computer Use runtime。請先安裝或啟用 Codex Computer Use 外掛。', '使用可能な Codex Computer Use runtime が見つかりません。先に Codex Computer Use プラグインをインストールまたは有効化してください。'))
 
 
 def atomic_write(path, content, default_mode=0o600):
@@ -60,7 +72,8 @@ def atomic_write(path, content, default_mode=0o600):
     descriptor, temporary = tempfile.mkstemp(prefix='.' + path.name + '-', dir=path.parent)
     try:
         with os.fdopen(descriptor, 'wb') as output:
-            os.fchmod(output.fileno(), mode)
+            if os.name != 'nt':
+                os.fchmod(output.fileno(), mode)
             output.write(content)
             output.flush()
             os.fsync(output.fileno())
@@ -127,10 +140,13 @@ def main():
     choice.add_argument('--uninstall', action='store_true', help=tr('Remove only this managed MCP entry; keep files.', '仅移除本项目管理的 MCP 配置项，保留文件。', '僅移除本專案管理的 MCP 設定項，保留檔案。', '管理対象の MCP 設定のみを削除し、ファイルは保持します。'))
     choice.add_argument('--auto-approve-apps', action='store_true', help=tr('Explicitly authorize automatic native-app access approvals.', '明确授权自动批准原生应用访问请求。', '明確授權自動核准原生應用程式存取請求。', 'ネイティブアプリへのアクセス要求の自動承認を明示的に許可します。'))
     args = parser.parse_args()
-    if sys.platform != 'darwin':
-        parser.error(tr('This integration requires macOS.', '此集成需要 macOS。', '此整合需要 macOS。', 'この連携には macOS が必要です。'))
+    if sys.platform not in ('darwin', 'win32'):
+        parser.error(tr('This integration requires macOS or Windows.', '此集成需要 macOS 或 Windows。', '此整合需要 macOS 或 Windows。', 'この連携には macOS または Windows が必要です。'))
     try:
         plan = configure(Path.home(), **vars(args))
+    except RuntimeNotFoundError as error:
+        print(str(error), file=sys.stderr)
+        return 1
     except (OSError, ValueError) as error:
         # Do not print configuration values or JSON parse excerpts.
         print(tr('Installation failed ({error}). Check runtime paths, config JSON, and conflicting cua_repl entries.',

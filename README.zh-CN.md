@@ -8,7 +8,7 @@
 
 - **还是 Claude，只换操作工具：** Claude 负责理解任务和决定操作，Codex 的 runtime 负责操作应用。
 - **应用授权方式自己选：** 默认弹窗确认，也可以主动开启所有应用自动允许。
-- **目前只支持 macOS：** 需要本机 Codex 的 computer use 已能正常使用，不包含 Codex 专用浏览器自动化。
+- **支持 macOS 和 Windows：** 需要同一台电脑上的 Codex computer use 已能正常使用。Windows 目前为实验性支持，不包含 Codex 专用浏览器自动化。
 
 它的实现是一个非官方 MCP 适配器，负责转发 `cua_repl` 工具调用和处理应用访问授权。
 
@@ -16,12 +16,12 @@
 
 ## 运行要求
 
-- macOS、Python 3.10 或更新版本，无需第三方 Python 库。
+- macOS 或 Windows、Python 3.10 或更新版本，无需第三方 Python 库。Windows 弹窗使用系统自带的 Windows PowerShell 和 .NET Windows Forms。
 - Claude Code，支持 Claude Desktop 的本地 Code 会话。
 - 已安装并能正常使用 `unified-computer-use` 插件的 Codex Desktop。
-- runtime 所需的 macOS 辅助功能和屏幕录制权限。
+- macOS 上需要授予 runtime 辅助功能和屏幕录制权限。
 
-安装程序从本机 Codex 插件配置中查找 runtime，不会下载 runtime。如果找不到可用安装，会报错退出。
+安装程序从 `~/.codex`（或 `CODEX_HOME`）中的 Codex 插件配置查找 runtime，不会下载 runtime。如果找不到可用安装，会报错退出。macOS 的 runtime 不能复制到 Windows 使用，需要先在 Windows 上安装并启用 Codex 的 computer use 插件。
 
 ## 安装
 
@@ -31,6 +31,15 @@
 python3 install.py --dry-run
 python3 install.py
 ```
+
+Windows 用户在下载的项目文件夹里打开 PowerShell，运行：
+
+```powershell
+py -3 install.py --dry-run
+py -3 install.py
+```
+
+如果没有 `py` 启动器，用 `python` 代替 `py -3`。请以平时使用 Claude 的 Windows 用户运行，安装器会修改该用户的配置。下文命令中的 `python3` 在 Windows 上同样换成 `py -3`。`~` 表示用户目录，通常是 `C:\Users\YOUR_NAME`。
 
 程序会把适配器复制到 `~/.claude/mcp-servers/claude-codex-computer-use/`，并在 `~/.claude.json` 中注册 `cua_repl`。原配置备份到 `~/.claude/backups/`，其他 MCP 配置保持不变。
 
@@ -42,7 +51,7 @@ python3 install.py
 
 默认情况下，应用访问请求会弹出标题为 **Claude · Codex Computer Use** 的确认框。点击“允许本次请求”或“拒绝”；20 秒内未选择会自动拒绝。此模式不创建永久白名单。
 
-适配器的弹窗和安装提示会跟随 macOS“语言与地区”中的第一首选语言，支持简体中文、繁体中文、英文和日文，其他语言回退英文。无法读取系统首选语言时，使用 locale 环境变量。更改系统语言后，需要重新打开 Claude Code 会话。runtime 原始请求文字、技术日志、JSON 字段名和 argparse 自带的用法及错误标签保留原文。
+适配器的弹窗和安装提示会跟随 macOS 首选语言或 Windows 用户界面语言，支持简体中文、繁体中文、英文和日文，其他语言回退英文。无法读取系统语言时，使用 locale 环境变量。更改系统语言后，需要重新打开 Claude Code 会话。runtime 原始请求文字、技术日志、JSON 字段名和 argparse 自带的用法及错误标签保留原文。
 
 如果明确希望所有应用访问都不再询问：
 
@@ -73,6 +82,8 @@ let finder = await cua.getApp("com.apple.finder");
 ```
 
 runtime 会返回 API 使用说明，后续操作按说明执行。适配器不另外定义一套 UI 操作 API。
+
+Windows 用户可以让 Claude 先列出窗口，再读取记事本界面，不要修改任何内容。使用 runtime 返回的窗口 ID 调用 `cua.getApp({windowId: ...})`，不能照搬 macOS 的应用名称或 bundle ID。Windows 下的输入操作可能会激活目标窗口。
 
 ## 解决什么问题
 
@@ -115,7 +126,7 @@ python3 install.py --uninstall
 python3 -B -m unittest discover -s tests -v
 ```
 
-测试覆盖授权路由、自动授权、拒绝和超时、协议转发、进程退出以及安装行为，不依赖 Codex、Claude 或真实桌面。真实 runtime 的验证需要另外进行；开发时已在 macOS 测试 Finder 和微信的界面读取、截图，以及 Claude Code 的工具调用。
+测试覆盖授权路由、自动授权、拒绝和超时、协议转发、进程退出以及安装行为，不依赖 Codex、Claude 或真实桌面。CI 覆盖 macOS、Ubuntu 和 Windows，桥接程序和安装器测试也已在 Windows 11 ARM64、Python 3.14 上通过。真实 runtime 的验证需要另外进行：macOS 已测试 Finder 和微信的界面读取、截图，以及 Claude Code 工具调用；Windows 尚未验证 Claude → Codex → 桌面操作的完整流程，因此暂标为实验性支持。
 
 ## 许可
 

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Relay MCP, rendering narrowly identified native-app approvals for a human."""
+import base64
 import concurrent.futures
+import ctypes
+from ctypes import wintypes
 import json
 from functools import lru_cache
 import plistlib
@@ -36,8 +39,110 @@ def system_language():
                 return normalize_language(languages[0])
         except (OSError, subprocess.SubprocessError, ValueError, TypeError, AttributeError, ExpatError):
             pass
+    if sys.platform == 'win32':
+        try:
+            return normalize_language(windows_language())
+        except (OSError, AttributeError, ValueError):
+            pass
     value = next((os.environ[key] for key in ('LC_ALL', 'LC_MESSAGES', 'LANG') if os.environ.get(key)), 'en')
     return normalize_language(value)
+
+
+def windows_language():
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    preferred = kernel.GetUserPreferredUILanguages
+    preferred.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.ULONG),
+                          wintypes.LPWSTR, ctypes.POINTER(wintypes.ULONG)]
+    preferred.restype = wintypes.BOOL
+    count, size = wintypes.ULONG(), wintypes.ULONG()
+    if preferred(8, ctypes.byref(count), None, ctypes.byref(size)) and size.value:
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if preferred(8, ctypes.byref(count), buffer, ctypes.byref(size)) and buffer.value:
+            return buffer.value
+    # Fall back to the user's UI language, never the machine installation language.
+    kernel.GetUserDefaultUILanguage.restype = wintypes.WORD
+    convert = kernel.LCIDToLocaleName
+    convert.argtypes = [wintypes.DWORD, wintypes.LPWSTR, ctypes.c_int, wintypes.DWORD]
+    convert.restype = ctypes.c_int
+    buffer = ctypes.create_unicode_buffer(85)
+    if convert(kernel.GetUserDefaultUILanguage(), buffer, len(buffer), 0):
+        return buffer.value
+    raise OSError('Cannot determine Windows UI language')
+
+
+def wait_readable(descriptor, timeout=0.1):
+    if sys.platform != 'win32':
+        return bool(select.select([descriptor], [], [], timeout)[0])
+    import msvcrt
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    handle = wintypes.HANDLE(msvcrt.get_osfhandle(descriptor))
+    peek = kernel.PeekNamedPipe
+    peek.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+                     ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
+                     ctypes.POINTER(wintypes.DWORD)]
+    peek.restype = wintypes.BOOL
+    available = wintypes.DWORD()
+    if not peek(handle, None, 0, None, ctypes.byref(available), None):
+        error = ctypes.get_last_error()
+        if error in (109, 232):  # Closed pipe: allow os.read to observe EOF.
+            return True
+        raise OSError(error, 'Cannot inspect MCP input pipe')
+    if available.value:
+        return True
+    time.sleep(timeout)
+    return False
+
+
+def dialog_command(message, deny, allow):
+    if sys.platform != 'win32':
+        return ['/usr/bin/osascript', '-e', DIALOG, '--', message, deny, allow]
+    # Encode data independently; app names and messages can never become PS code.
+    payload = base64.b64encode(json.dumps([message, deny, allow], ensure_ascii=False).encode()).decode()
+    script = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$data = ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('PAYLOAD')))
+$form = New-Object Windows.Forms.Form
+$form.Text = 'Claude · Codex Computer Use'
+$form.Size = New-Object Drawing.Size(620, 540)
+$form.StartPosition = 'CenterScreen'
+$form.TopMost = $true
+$form.Tag = 'deny'
+$text = New-Object Windows.Forms.TextBox
+$text.Multiline = $true
+$text.ReadOnly = $true
+$text.ScrollBars = 'Vertical'
+$text.Location = New-Object Drawing.Point(15, 15)
+$text.Size = New-Object Drawing.Size(570, 410)
+$text.Text = $data[0].Replace("`n", "`r`n")
+$form.Controls.Add($text)
+$deny = New-Object Windows.Forms.Button
+$deny.Text = $data[1]
+$deny.Location = New-Object Drawing.Point(265, 445)
+$deny.Size = New-Object Drawing.Size(150, 35)
+$deny.DialogResult = 'Cancel'
+$form.Controls.Add($deny)
+$allow = New-Object Windows.Forms.Button
+$allow.Text = $data[2]
+$allow.Location = New-Object Drawing.Point(425, 445)
+$allow.Size = New-Object Drawing.Size(160, 35)
+$allow.Add_Click({ $form.Tag = 'allow'; $form.Close() })
+$form.Controls.Add($allow)
+$form.AcceptButton = $deny
+$form.CancelButton = $deny
+$form.Add_Shown({ $deny.Select() })
+$timer = New-Object Windows.Forms.Timer
+$timer.Interval = 20000
+$timer.Add_Tick({ $timer.Stop(); $form.Close() })
+$timer.Start()
+try { [void]$form.ShowDialog(); [Console]::WriteLine($form.Tag) }
+finally { $timer.Dispose(); $form.Dispose() }
+""".replace('PAYLOAD', payload)
+    encoded = base64.b64encode(script.encode('utf-16le')).decode()
+    executable = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'),
+                              'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    return [executable, '-NoLogo', '-NoProfile', '-NonInteractive', '-STA', '-EncodedCommand', encoded]
 
 
 def tr(en, hans, hant, ja):
@@ -52,6 +157,23 @@ if gave up of resultValue then return "timeout"
 if button returned of resultValue is allowLabel then return "allow"
 return "deny"
 end run'''
+
+
+def windows_app_request(params):
+    meta = params.get('_meta', {})
+    display = meta.get('tool_params_display')
+    if (meta.get('connector_name') != 'Computer Use' or 'tool_name' in meta
+            or meta.get('persist') not in (['session'], ['session', 'always'])
+            or set(meta.get('tool_params', {})) != {'app'}
+            or not isinstance(display, list) or len(display) != 1
+            or not isinstance(display[0], dict)
+            or set(display[0]) != {'name', 'display_name', 'value'}
+            or display[0].get('name') != 'app' or display[0].get('display_name') != 'App'):
+        return False
+    name = display[0].get('value')
+    return (isinstance(name, str) and 0 < len(name) <= 512 and name.strip() == name
+            and not any(ord(c) < 32 for c in name)
+            and params.get('message') == f'Allow Codex to use {name}?')
 
 
 def approval_text(request):
@@ -72,6 +194,8 @@ def approval_text(request):
     if not isinstance(tool_params, dict):
         return None
     app, action = tool_params.get('app'), meta.get('tool_name')
+    if action is None and windows_app_request(params):
+        action = 'app_access'
     def label(value):
         return isinstance(value, str) and 0 < len(value) <= 512 and value.strip() == value and not any(ord(c) < 32 for c in value)
     if not label(app) or not label(action) or app == 'computer-audio' or action == 'start_audio_recording':
@@ -95,10 +219,10 @@ def prompt_user(message, stopped, runner=subprocess.Popen):
     started = time.monotonic()
     print("[cua-bridge] approval dialog opened", file=sys.stderr, flush=True)
     try:
-        process = runner(['/usr/bin/osascript', '-e', DIALOG, '--', message,
-                          tr('Deny', '拒绝', '拒絕', '拒否'),
-                          tr('Allow this request', '允许本次请求', '允許本次請求', '今回のみ許可')],
-                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        process = runner(dialog_command(message, tr('Deny', '拒绝', '拒絕', '拒否'),
+                                        tr('Allow this request', '允许本次请求', '允許本次請求', '今回のみ許可')),
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                         encoding='utf-8', creationflags=0x08000000 if sys.platform == 'win32' else 0)
         for _ in range(230):
             if stopped.is_set():
                 return False
@@ -132,7 +256,8 @@ def route(line, send_client, send_server, approve):
     params = request['params']
     if (os.environ.get('CUA_BRIDGE_AUTO_APPROVE_APPS') == '1'
             and set(params['_meta']['tool_params']) == {'app'}
-            and re.fullmatch(r'Allow Computer Use to use "[^"\x00-\x1f]+"\?', params['message'])):
+            and (re.fullmatch(r'Allow Computer Use to use "[^"\x00-\x1f]+"\?', params['message'])
+                 or windows_app_request(params))):
         accepted = True
         print('[cua-bridge] app access approved by explicit configuration', file=sys.stderr, flush=True)
     else:
@@ -148,23 +273,35 @@ def main(argv):
     if not argv:
         print('Usage: bridge.py COMMAND [ARGS...]', file=sys.stderr)
         return 2
+    if sys.platform == 'win32':
+        import msvcrt
+        for stream in (sys.stdin, sys.stdout):
+            msvcrt.setmode(stream.fileno(), os.O_BINARY)
     child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                             stderr=sys.stderr, start_new_session=True)
+                             stderr=sys.stderr, start_new_session=sys.platform != 'win32')
     stopped = threading.Event()
     input_lock, output_lock = threading.Lock(), threading.Lock()
     def force_stop():
         if child.poll() is None:
             try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except OSError:
-                pass
+                if sys.platform == 'win32':
+                    subprocess.run(['taskkill.exe', '/PID', str(child.pid), '/T', '/F'],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3,
+                                   creationflags=0x08000000)
+                else:
+                    os.killpg(child.pid, signal.SIGKILL)
+            except (OSError, subprocess.SubprocessError):
+                child.kill()
     def stop(*_):
         if stopped.is_set():
             return
         stopped.set()
         if child.poll() is None:
             try:
-                os.killpg(child.pid, signal.SIGTERM)
+                if sys.platform == 'win32':
+                    force_stop()
+                else:
+                    os.killpg(child.pid, signal.SIGTERM)
             except OSError:
                 pass
             timer = threading.Timer(3, force_stop)
@@ -187,8 +324,7 @@ def main(argv):
         try:
             descriptor = sys.stdin.fileno()
             while not stopped.is_set():
-                readable, _, _ = select.select([descriptor], [], [], 0.1)
-                if not readable:
+                if not wait_readable(descriptor):
                     continue
                 chunk = os.read(descriptor, 65536)
                 if not chunk:
