@@ -118,7 +118,17 @@ The bridge handles recognized app-access requests locally and forwards the rest 
 python3 install.py --uninstall
 ```
 
-Uninstallation removes only this tool's `cua_repl` entry. It leaves the bridge file and backups on disk and does not overwrite other settings. If you previously disabled Claude's built-in computer use, you can re-enable it in Claude Desktop.
+Quit Claude Desktop before uninstalling. Uninstallation restores the `cua_repl` configuration from before the first installation (or removes the entry if none existed), and automatically re-enables Claude Desktop's built-in Computer Use. Other MCP servers and settings you changed later are preserved. Reopen Claude Desktop afterward.
+
+Reinstalling keeps the original restore point. Older installations use this project's installation backups when the original state can be identified; if recovery information is missing or invalid, the installer reports the problem instead of guessing. If no Claude Desktop configuration is found, the result explicitly reports that the built-in switch could not be updated. Bridge files and backups remain on disk for recovery; they are no longer registered as this MCP server.
+
+Preview the restoration without changing anything:
+
+```sh
+python3 install.py --uninstall --dry-run
+```
+
+If multiple Claude Desktop profiles are found, specify the active `claude_desktop_config.json` with `--desktop-config PATH`. The installer will not guess which profile to modify.
 
 ## Development
 

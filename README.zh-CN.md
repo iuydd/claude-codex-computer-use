@@ -118,7 +118,17 @@ Computer Use was not approved to use Finder
 python3 install.py --uninstall
 ```
 
-只移除本工具管理的 `cua_repl` 配置，保留磁盘上的适配器文件和备份，不覆盖其他设置。如果之前关闭了 Claude 自带的 computer use，可以自行重新打开。
+卸载前先退出 Claude Desktop。卸载会恢复首次安装前的 `cua_repl` 配置；原来没有该配置项，就将它移除。同时自动重新开启 Claude Desktop 内置的 Computer Use。其他 MCP 服务和安装后修改的设置会保留。完成后重新打开 Claude Desktop 即可。
+
+重复安装不会覆盖最初的恢复点。旧版安装会尝试从本项目的安装备份中确定原始状态；恢复信息缺失或损坏时会明确报错，不会猜测。如果找不到 Claude Desktop 配置，结果会明确说明内置开关未能更新。桥接文件和备份仍保留在磁盘上，供恢复使用，但不再作为本工具的 MCP 服务注册。
+
+可以先预览卸载将恢复哪些内容，不会修改任何文件：
+
+```sh
+python3 install.py --uninstall --dry-run
+```
+
+如果检测到多个 Claude Desktop 配置，使用 `--desktop-config PATH` 指定正在使用的 `claude_desktop_config.json`。安装器不会自行猜测该修改哪份配置。
 
 ## 开发与测试
 
