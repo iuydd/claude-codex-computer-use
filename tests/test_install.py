@@ -18,7 +18,8 @@ class InstallTests(unittest.TestCase):
         environment = patch.dict(os.environ)
         environment.start()
         self.addCleanup(environment.stop)
-        os.environ.pop('CODEX_HOME', None)
+        for key in ('CODEX_HOME', 'APPDATA', 'LOCALAPPDATA', 'CLAUDE_USER_DATA_DIR'):
+            os.environ.pop(key, None)
         language = patch("bridge.system_language", return_value="en")
         language.start()
         self.addCleanup(language.stop)
@@ -104,6 +105,7 @@ class InstallTests(unittest.TestCase):
         old = str(self.home / '.claude/mcp-servers/cua-repl-bridge/bridge.py')
         self.config.write_text(json.dumps({'mcpServers': {'cua_repl': {
             'command': sys.executable, 'args': ['-B', old, str(self.runtime/'node'), str(self.runtime/'cua-repl.mjs')]}}}))
+        self.legacy_backup({})
         self.run_install()
         self.assertEqual(self.read()['mcpServers']['cua_repl']['args'][1], str(install.managed_path(self.home)))
 
@@ -173,6 +175,163 @@ class InstallTests(unittest.TestCase):
         with patch.object(sys, 'argv', ['install.py']), patch('install.sys.platform', 'win32'), patch('install.Path.home', return_value=self.home), redirect_stderr(errors):
             self.assertEqual(install.main(), 1)
         self.assertIn('No usable Codex computer-use runtime', errors.getvalue())
+
+    def legacy_backup(self, config):
+        path = self.home / '.claude/backups/claude.json.before-cua-repl-20260924-103502'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(config), encoding='utf-8')
+        return path
+
+    def desktop_file(self, data=None):
+        path = install.desktop_config_path(self.home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data or {'preferences': {'chicagoEnabled': False, 'other': 7}, 'keep': 8}), encoding='utf-8')
+        return path
+
+    def test_uninstall_restores_baseline_and_enables_desktop_preserving_changes(self):
+        self.run_install()
+        state_path = install.managed_path(self.home).parent / 'install-state.json'
+        first_state = state_path.read_bytes()
+        self.run_install(auto_approve_apps=True)
+        self.assertEqual(first_state, state_path.read_bytes())
+        current = self.read()
+        current['later'] = 'keep me'
+        current['mcpServers']['other'] = {'command': 'keep'}
+        self.config.write_text(json.dumps(current), encoding='utf-8')
+        desktop = self.desktop_file()
+        plan = self.run_install(uninstall=True)
+        self.assertEqual(self.read(), {'later': 'keep me', 'mcpServers': {'other': {'command': 'keep'}}})
+        self.assertEqual(json.loads(desktop.read_text()), {'preferences': {'chicagoEnabled': True, 'other': 7}, 'keep': 8})
+        self.assertEqual(plan['desktop_computer_use'], 'enabled')
+        self.assertFalse(json.loads(state_path.read_text())['active'])
+        self.assertTrue(install.managed_path(self.home).exists())
+
+    def test_legacy_original_entry_restored_and_unknown_baseline_refused(self):
+        old = {'command': sys.executable, 'args': ['-B', str(self.home / '.claude/mcp-servers/cua-repl-bridge/bridge.py'), 'node', 'runtime']}
+        self.config.write_text(json.dumps({'mcpServers': {'cua_repl': old}}))
+        original = self.config.read_bytes()
+        with self.assertRaises(ValueError):
+            self.run_install(uninstall=True)
+        self.assertEqual(original, self.config.read_bytes())
+        baseline = {'command': 'original-runtime', 'args': ['original']}
+        self.legacy_backup({'mcpServers': {'cua_repl': baseline}})
+        self.run_install()
+        self.run_install(uninstall=True)
+        self.assertEqual(self.read()['mcpServers']['cua_repl'], baseline)
+        self.assertEqual(self.run_install(uninstall=True)['action'], 'nothing to uninstall')
+
+    def test_uninstall_dry_run_missing_desktop_and_malformed_desktop(self):
+        self.run_install()
+        before = {str(p): p.read_bytes() for p in self.home.rglob('*') if p.is_file()}
+        plan = self.run_install(uninstall=True, dry_run=True)
+        self.assertIn('missing', plan['desktop_computer_use'])
+        self.assertEqual(before, {str(p): p.read_bytes() for p in self.home.rglob('*') if p.is_file()})
+        desktop = self.desktop_file()
+        desktop.write_text('{bad json')
+        before = self.config.read_bytes()
+        with self.assertRaises(ValueError):
+            self.run_install(uninstall=True)
+        self.assertEqual(self.config.read_bytes(), before)
+
+    def test_malformed_state_refused(self):
+        self.run_install()
+        state = install.managed_path(self.home).parent / 'install-state.json'
+        state.write_text('{}')
+        before = self.config.read_bytes()
+        with self.assertRaises(ValueError):
+            self.run_install(uninstall=True)
+        self.assertEqual(before, self.config.read_bytes())
+
+    def test_state_symlink_refused(self):
+        self.run_install()
+        state = install.managed_path(self.home).parent / 'install-state.json'
+        target = state.with_name('actual-state.json')
+        state.rename(target)
+        try:
+            state.symlink_to(target)
+        except OSError:
+            # Exercise the refusal even when Windows denies creating real symlinks.
+            original_is_symlink = Path.is_symlink
+            with patch.object(Path, 'is_symlink', lambda path: path == state or original_is_symlink(path)):
+                with self.assertRaises(ValueError):
+                    self.run_install(uninstall=True)
+        else:
+            with self.assertRaises(ValueError):
+                self.run_install(uninstall=True)
+        self.assertTrue(target.exists())
+
+    def test_partial_failure_rolls_back_desktop_and_mcp(self):
+        self.run_install()
+        desktop = self.desktop_file()
+        state = install.managed_path(self.home).parent / 'install-state.json'
+        before = {p: p.read_bytes() for p in (desktop, self.config, state)}
+        real_write = install.atomic_write
+        failed = False
+        def fail_once(path, content, *args):
+            nonlocal failed
+            if Path(path) == state and not failed:
+                failed = True
+                raise OSError('simulated disk error')
+            return real_write(path, content, *args)
+        with patch('install.atomic_write', side_effect=fail_once), self.assertRaises(OSError):
+            self.run_install(uninstall=True)
+        self.assertEqual(before, {p: p.read_bytes() for p in before})
+        self.assertTrue(list((self.home / '.claude/backups').glob('*')))
+
+    def test_windows_multiple_desktop_configs_require_selection(self):
+        with patch('install.sys.platform', 'win32'):
+            first = self.desktop_file()
+            second = self.home / 'AppData/Local/Claude/claude_desktop_config.json'
+            second.parent.mkdir(parents=True)
+            second.write_text('{}')
+            with self.assertRaises(ValueError):
+                install.desktop_config_path(self.home)
+            self.assertEqual(install.desktop_config_path(self.home, first), first)
+
+    def test_desktop_process_guard(self):
+        import subprocess
+        for platform, result, fails in [('darwin', subprocess.CompletedProcess([], 1), False),
+                                       ('darwin', subprocess.CompletedProcess([], 0), True),
+                                       ('win32', subprocess.CompletedProcess([], 0, '"Claude.exe","10"'), True),
+                                       ('win32', subprocess.CompletedProcess([], 0, 'INFO: no tasks'), False)]:
+            with self.subTest(platform=platform, fails=fails), patch('install.sys.platform', platform), patch('install.subprocess.run', return_value=result):
+                if fails:
+                    with self.assertRaises(install.RuntimeNotFoundError):
+                        install.require_desktop_closed()
+                else:
+                    install.require_desktop_closed()
+        with patch('install.subprocess.run', side_effect=OSError('missing tool')), self.assertRaises(install.RuntimeNotFoundError):
+            install.require_desktop_closed()
+
+    def test_inactive_state_with_external_bridge_reinstall_uninstalls_again(self):
+        self.run_install()
+        installed = self.read()['mcpServers']['cua_repl']
+        self.run_install(uninstall=True)
+        restored = self.read()
+        restored['mcpServers']['cua_repl'] = installed
+        self.config.write_text(json.dumps(restored))
+        self.assertEqual(self.run_install(uninstall=True)['action'], 'uninstall')
+        self.assertNotIn('cua_repl', self.read()['mcpServers'])
+        restored['mcpServers']['cua_repl'] = {'command': 'unmanaged'}
+        self.config.write_text(json.dumps(restored))
+        with self.assertRaises(install.ActionRequiredError):
+            self.run_install(uninstall=True)
+
+    def test_desktop_config_cannot_alias_managed_files(self):
+        self.run_install()
+        destination = install.managed_path(self.home)
+        state = destination.parent / 'install-state.json'
+        before = {path: path.read_bytes() for path in (self.config, destination, state)}
+        for target in (self.config, destination, state, destination.parent / '..' / destination.parent.name / 'install-state.json'):
+            with self.subTest(target=target), self.assertRaises(install.ActionRequiredError):
+                self.run_install(uninstall=True, desktop_config=target)
+        self.assertEqual(before, {path: path.read_bytes() for path in before})
+
+    def test_actionable_cli_errors_are_visible(self):
+        errors = io.StringIO()
+        with patch.object(sys, 'argv', ['install.py']), patch('install.sys.platform', 'win32'), patch('install.configure', side_effect=install.ActionRequiredError('Use --desktop-config PATH')), redirect_stderr(errors):
+            self.assertEqual(install.main(), 1)
+        self.assertIn('--desktop-config PATH', errors.getvalue())
 
     def test_cli_localization_preserves_machine_json_and_hides_config_errors(self):
         cases = [('en', 'Show the plan', 'Plan prepared.', 'Installation failed'),
