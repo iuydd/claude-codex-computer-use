@@ -2,6 +2,7 @@ import copy
 import json
 import os
 import pathlib
+import plistlib
 import select
 import subprocess
 import sys
@@ -21,6 +22,9 @@ REQUEST = {'jsonrpc': '2.0', 'id': 7, 'method': 'elicitation/create', 'params': 
 
 class BridgeTests(unittest.TestCase):
     def setUp(self):
+        language = patch('bridge.system_language', return_value='zh-Hans')
+        language.start()
+        self.addCleanup(language.stop)
         environment = patch.dict(os.environ, {'CUA_BRIDGE_AUTO_APPROVE_APPS': '0'})
         environment.start()
         self.addCleanup(environment.stop)
@@ -140,14 +144,14 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(server, [])
 
     def test_dialog_result_and_errors(self):
-        for output, code, expected in [('允许本次请求\n', 0, True), ('拒绝\n', 0, False),
-                                       ('timeout\n', 0, False), ('允许本次请求\n', 1, False)]:
+        for output, code, expected in [('allow\n', 0, True), ('deny\n', 0, False),
+                                       ('timeout\n', 0, False), ('allow\n', 1, False), ('允许本次请求\n', 0, False)]:
             process = Mock(returncode=code)
             process.communicate.return_value = (output, None)
             process.poll.return_value = code
             runner = Mock(return_value=process)
             self.assertEqual(bridge.prompt_user('app and action', threading.Event(), runner), expected)
-            self.assertEqual(runner.call_args.args[0][-2:], ['--', 'app and action'])
+            self.assertEqual(runner.call_args.args[0][-4:], ['--', 'app and action', '拒绝', '允许本次请求'])
         self.assertFalse(bridge.prompt_user('x', threading.Event(), Mock(side_effect=OSError())))
 
     def test_timeout_and_shutdown_kill_dialog(self):
@@ -189,6 +193,72 @@ class BridgeTests(unittest.TestCase):
                 process.wait()
             process.stdout.close()
             process.stderr.close()
+
+
+class LanguageTests(unittest.TestCase):
+    def setUp(self):
+        bridge.system_language.cache_clear()
+        self.addCleanup(bridge.system_language.cache_clear)
+
+    def test_language_variants(self):
+        for value, expected in [('zh-Hans-JP', 'zh-Hans'), ('zh-Hant-CN', 'zh-Hant'),
+                                ('zh_CN.UTF-8', 'zh-Hans'), ('zh_TW.UTF-8', 'zh-Hant'),
+                                ('zh-HK', 'zh-Hant'), ('zh-MO', 'zh-Hant'),
+                                ('ja_JP.UTF-8', 'ja'), ('en-GB', 'en'), ('fr-FR', 'en'), ('C', 'en')]:
+            with self.subTest(value=value):
+                self.assertEqual(bridge.normalize_language(value), expected)
+
+    def test_macos_primary_language_overrides_terminal_and_is_cached(self):
+        result = Mock(stdout=plistlib.dumps({'AppleLanguages': ['zh-Hans-JP', 'ja-JP']}))
+        with patch('bridge.sys.platform', 'darwin'), patch.dict(os.environ, {'LANG': 'ja_JP.UTF-8'}, clear=True), patch('bridge.subprocess.run', return_value=result) as run:
+            self.assertEqual(bridge.system_language(), 'zh-Hans')
+            self.assertEqual(bridge.system_language(), 'zh-Hans')
+            run.assert_called_once_with(['/usr/bin/defaults', 'export', '-g', '-'], capture_output=True, timeout=2, check=True)
+
+    def test_unsupported_primary_language_falls_back_to_english(self):
+        result = Mock(stdout=plistlib.dumps({'AppleLanguages': ['fr-FR', 'ja-JP']}))
+        with patch('bridge.sys.platform', 'darwin'), patch('bridge.subprocess.run', return_value=result):
+            self.assertEqual(bridge.system_language(), 'en')
+
+    def test_system_preference_failures_use_environment(self):
+        failures = [OSError(), subprocess.TimeoutExpired('defaults', 2),
+                    subprocess.CalledProcessError(1, 'defaults')]
+        outputs = [b'not a plist', b'<?xml version="1.0"?><plist><broken>',
+                   plistlib.dumps({}), plistlib.dumps({'AppleLanguages': []}),
+                   plistlib.dumps({'AppleLanguages': [42]}), plistlib.dumps([])]
+        for failure, output in [(e, None) for e in failures] + [(None, o) for o in outputs]:
+            bridge.system_language.cache_clear()
+            with self.subTest(failure=failure, output=output), patch('bridge.sys.platform', 'darwin'), patch.dict(os.environ, {'LC_MESSAGES': 'zh_TW.UTF-8', 'LANG': 'ja_JP.UTF-8'}, clear=True), patch('bridge.subprocess.run', side_effect=failure, return_value=Mock(stdout=output)):
+                self.assertEqual(bridge.system_language(), 'zh-Hant')
+
+    def test_environment_priority_and_empty_environment(self):
+        for env, expected in [({'LC_ALL': 'ja_JP', 'LC_MESSAGES': 'zh_TW', 'LANG': 'en_US'}, 'ja'),
+                              ({'LC_ALL': '', 'LANG': 'zh_CN'}, 'zh-Hans'), ({}, 'en')]:
+            bridge.system_language.cache_clear()
+            with patch('bridge.sys.platform', 'linux'), patch.dict(os.environ, env, clear=True), patch('bridge.subprocess.run') as run:
+                self.assertEqual(bridge.system_language(), expected)
+                run.assert_not_called()
+
+    def test_dialog_language_and_machine_decisions(self):
+        for language, labels, phrase in [('en', ['Deny', 'Allow this request'], 'no permanent allowlist'),
+                                         ('zh-Hans', ['拒绝', '允许本次请求'], '不创建永久白名单'),
+                                         ('zh-Hant', ['拒絕', '允許本次請求'], '不建立永久允許清單'),
+                                         ('ja', ['拒否', '今回のみ許可'], '永続的な許可リスト')]:
+            with patch('bridge.system_language', return_value=language):
+                request = copy.deepcopy(REQUEST)
+                request['params']['_meta']['subtitle'] = 'Raw subtitle'
+                text = bridge.approval_text(request)
+                self.assertIn(phrase, text)
+                self.assertIn(request['params']['message'], text)
+                self.assertIn('Raw subtitle', text)
+                for output, code, expected in [('allow', 0, True), ('deny', 0, False), ('timeout', 0, False), ('allow', 1, False), (labels[1], 0, False)]:
+                    with self.subTest(language=language, output=output):
+                        process = Mock(returncode=code)
+                        process.communicate.return_value = (output, '')
+                        process.poll.return_value = code
+                        runner = Mock(return_value=process)
+                        self.assertEqual(bridge.prompt_user(text, threading.Event(), runner), expected)
+                        self.assertEqual(runner.call_args.args[0][-2:], labels)
 
 
 if __name__ == '__main__':

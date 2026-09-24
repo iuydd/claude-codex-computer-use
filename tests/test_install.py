@@ -1,4 +1,7 @@
 import json
+import io
+from contextlib import redirect_stdout, redirect_stderr
+from unittest.mock import patch
 from pathlib import Path
 import stat
 import sys
@@ -11,6 +14,9 @@ import install
 
 class InstallTests(unittest.TestCase):
     def setUp(self):
+        language = patch("bridge.system_language", return_value="en")
+        language.start()
+        self.addCleanup(language.stop)
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.home = Path(self.temporary.name)
@@ -101,6 +107,32 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(self.read(), {'mcpServers': {'other': {'command': 'keep'}}, 'keep': 42})
         self.assertTrue(install.managed_path(self.home).exists())
         self.assertEqual(self.run_install(uninstall=True)['action'], 'nothing to uninstall')
+
+
+    def test_cli_localization_preserves_machine_json_and_hides_config_errors(self):
+        cases = [('en', 'Show the plan', 'Plan prepared.', 'Installation failed'),
+                 ('zh-Hans', '显示执行计划', '执行计划已生成。', '安装失败'),
+                 ('zh-Hant', '顯示執行計畫', '執行計畫已產生。', '安裝失敗'),
+                 ('ja', '実行計画を表示', '実行計画を作成しました。', 'インストールに失敗')]
+        for language, help_text, success, error_text in cases:
+            with self.subTest(language=language), patch('bridge.system_language', return_value=language):
+                output = io.StringIO()
+                with patch.object(sys, 'argv', ['install.py', '--help']), redirect_stdout(output), self.assertRaises(SystemExit) as raised:
+                    install.main()
+                self.assertEqual(raised.exception.code, 0)
+                self.assertIn(help_text, output.getvalue())
+                output, errors = io.StringIO(), io.StringIO()
+                plan = {'action': 'install', 'dry_run': True}
+                with patch.object(sys, 'argv', ['install.py', '--dry-run']), patch('install.sys.platform', 'darwin'), patch('install.configure', return_value=plan), redirect_stdout(output), redirect_stderr(errors):
+                    self.assertEqual(install.main(), 0)
+                self.assertEqual(json.loads(output.getvalue()), plan)
+                self.assertIn(success, errors.getvalue())
+                output, errors = io.StringIO(), io.StringIO()
+                with patch.object(sys, 'argv', ['install.py']), patch('install.sys.platform', 'darwin'), patch('install.configure', side_effect=ValueError('secret configuration')), redirect_stdout(output), redirect_stderr(errors):
+                    self.assertEqual(install.main(), 1)
+                self.assertIn(error_text, errors.getvalue())
+                self.assertNotIn('secret configuration', errors.getvalue())
+                self.assertEqual(output.getvalue(), '')
 
 
 if __name__ == '__main__':
