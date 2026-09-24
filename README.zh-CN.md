@@ -98,6 +98,8 @@ Computer Use was not approved to use Finder
 ## 限制
 
 - 只启用桌面应用控制。Codex 专属浏览器通道依赖 Codex 会话信息，安装程序不会启用。通过桌面应用界面控制浏览器属于另一种控制方式。
+- macOS 游戏进程需要能被系统识别为 app。裸可执行文件启动的游戏可能使 `cua.getApp(...)` 报 `Invalid app`；测试中把拥有窗口的 CrossOver 游戏进程放进已登记的 `.app` 后可以访问。这个适配器不会替游戏打包或登记 app。
+- 当前 `cua_repl` API 有 `drag`，但没有单独移动鼠标的操作。`drag` 会按住鼠标键，可能触发游戏内动作，不能拿来代替不点击的视角移动。
 - 这是非官方适配，OpenAI 和 Anthropic 均未维护或认可此项目。runtime 路径、请求格式和宿主行为可能随更新改变。
 - 复制项目不会带走 Codex 的 runtime 或 macOS 权限。
 - 适配器退出时会清理子进程，但没有复刻 Codex 宿主专用的回合结束 hooks。

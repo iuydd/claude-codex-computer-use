@@ -98,6 +98,8 @@ The bridge handles recognized app-access requests locally and forwards the rest 
 ## Limits
 
 - **Native desktop apps only.** Codex-specific browser automation depends on Codex session metadata and is not enabled by this installer. A browser can still be a native desktop app; that is a different control surface.
+- **macOS games must appear as apps.** `cua.getApp(...)` needs an app that macOS can identify. A game launched as a bare executable may return `Invalid app`; wrapping its window-owning process in a registered `.app` made a CrossOver game accessible in testing. This bridge does not package or register games for you.
+- **No pointer-only movement.** The current `cua_repl` API has `drag` but no separate mouse-move action. A drag holds the mouse button and may trigger in-game actions, so it is not a substitute for moving the camera without clicking.
 - **Not an official integration.** Neither OpenAI nor Anthropic maintains or endorses this project. Runtime paths, request formats, and host behavior can change.
 - **Not a portable runtime.** Moving the repository to another machine does not move the Codex installation or its permissions.
 - **No host lifecycle integration.** The bridge cleans up its child process on exit, but does not reproduce Codex's host-specific turn hooks.
