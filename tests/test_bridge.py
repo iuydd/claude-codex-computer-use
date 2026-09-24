@@ -1,9 +1,10 @@
+import base64
 import copy
 import json
 import os
 import pathlib
 import plistlib
-import select
+import time
 import subprocess
 import sys
 import threading
@@ -82,14 +83,23 @@ class BridgeTests(unittest.TestCase):
 
     def check_open_stdin_shutdown(self, terminate):
         script = 'import sys\nprint("ready", flush=True)\nsys.stdin.readline()\n'
-        process = subprocess.Popen([sys.executable, '-B', bridge.__file__,
-                                    sys.executable, '-u', '-c', script],
+        command = [sys.executable, '-B', bridge.__file__, sys.executable, '-u', '-c', script]
+        if terminate and sys.platform == 'win32':
+            script = 'import time\nprint("ready", flush=True)\nwhile True:\n time.sleep(.1); print("heartbeat", flush=True)'
+            # Windows TerminateProcess cannot invoke a SIGTERM handler. Exercise
+            # the same handler through a locally raised signal instead.
+            wrapper = 'import bridge,threading,signal,sys; threading.Timer(1, lambda: signal.raise_signal(signal.SIGTERM)).start(); sys.exit(bridge.main(sys.argv[1:]))'
+            command = [sys.executable, '-B', '-c', wrapper, sys.executable, '-u', '-c', script]
+        process = subprocess.Popen(command,
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
-            self.assertTrue(select.select([process.stdout], [], [], 5)[0], 'server did not start')
-            self.assertEqual(process.stdout.readline(), b'ready\n')
+            deadline = time.monotonic() + 5
+            while not bridge.wait_readable(process.stdout.fileno()):
+                self.assertLess(time.monotonic(), deadline, 'server did not start')
+            self.assertEqual(process.stdout.readline().rstrip(b'\r\n'), b'ready')
             if terminate:
-                process.terminate()
+                if sys.platform != 'win32':
+                    process.terminate()
             else:
                 process.stdin.write(b'exit\n')
                 process.stdin.flush()
@@ -143,6 +153,7 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(client, [raw])
             self.assertEqual(server, [])
 
+    @patch('bridge.sys.platform', 'darwin')
     def test_dialog_result_and_errors(self):
         for output, code, expected in [('allow\n', 0, True), ('deny\n', 0, False),
                                        ('timeout\n', 0, False), ('allow\n', 1, False), ('允许本次请求\n', 0, False)]:
@@ -194,11 +205,84 @@ class BridgeTests(unittest.TestCase):
             process.stdout.close()
             process.stderr.close()
 
+    def test_windows_runtime_approval_shape_and_scope(self):
+        request = copy.deepcopy(REQUEST)
+        params = request['params']
+        params['message'] = 'Allow Codex to use 微信?'
+        params['_meta'] = {
+            'codex_approval_kind': 'mcp_tool_call', 'connector_id': 'computer-use',
+            'connector_name': 'Computer Use', 'persist': ['session', 'always'],
+            'riskLevel': 'low', 'tool_params': {'app': r'C:\Apps\WeChat.exe'},
+            'tool_params_display': [{'name': 'app', 'display_name': 'App', 'value': '微信'}]}
+        for auto in ['0', '1']:
+            with patch.dict(os.environ, {'CUA_BRIDGE_AUTO_APPROVE_APPS': auto}):
+                approve = Mock(return_value=True)
+                client, server = self.routed(request, approve)
+                self.assertEqual(client, [])
+                self.assertEqual(json.loads(server[0])['result'], {'action': 'accept', 'content': {}})
+                self.assertEqual(approve.call_count, 0 if auto == '1' else 1)
+        for change in ['message', 'audio', 'display', 'params', 'connector']:
+            invalid = copy.deepcopy(request)
+            if change == 'message':
+                invalid['params']['message'] += ' And delete files.'
+            elif change == 'audio':
+                invalid['params']['_meta']['tool_params']['app'] = 'computer-audio'
+            elif change == 'display':
+                invalid['params']['_meta']['tool_params_display'][0]['value'] = 'Other'
+            elif change == 'params':
+                invalid['params']['_meta']['tool_params']['delete'] = True
+            else:
+                invalid['params']['_meta']['connector_id'] = 'other'
+            client, server = self.routed(invalid, Mock(side_effect=AssertionError('must forward')))
+            self.assertEqual(len(client), 1)
+            self.assertEqual(server, [])
+
+    def test_windows_dialog_uses_encoded_data_and_explicit_allow(self):
+        message = '微信 "quoted"; $(Start-Process bad)\n中文'
+        with patch('bridge.sys.platform', 'win32'):
+            command = bridge.dialog_command(message, '拒绝', '允许')
+            script = base64.b64decode(command[-1]).decode('utf-16le')
+            self.assertIn("$form.AcceptButton = $deny", script)
+            self.assertIn("$form.CancelButton = $deny", script)
+            self.assertIn('$timer.Interval = 20000', script)
+            self.assertNotIn(message, script)
+            payload = script.split("FromBase64String('")[1].split("')")[0]
+            self.assertEqual(json.loads(base64.b64decode(payload)), [message, '拒绝', '允许'])
+            for output, expected in [('allow', True), ('deny', False), ('', False)]:
+                process = Mock(returncode=0)
+                process.communicate.return_value = (output, None)
+                process.poll.return_value = 0
+                runner = Mock(return_value=process)
+                self.assertEqual(bridge.prompt_user(message, threading.Event(), runner), expected)
+                self.assertEqual(runner.call_args.kwargs['encoding'], 'utf-8')
+
+    def test_binary_unicode_roundtrip(self):
+        script = 'import sys; data=sys.stdin.buffer.readline(); sys.stdout.buffer.write(data); sys.stdout.buffer.flush()'
+        request = '{"message":"微信 日本語"}\n'.encode()
+        process = subprocess.Popen([sys.executable, '-B', bridge.__file__, sys.executable, '-u', '-c', script],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            process.stdin.write(request)
+            process.stdin.flush()
+            self.assertEqual(process.stdout.readline(), request)
+            self.assertEqual(process.wait(timeout=5), 0)
+            self.assertEqual(process.stderr.read(), b'')
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            for stream in (process.stdin, process.stdout, process.stderr):
+                stream.close()
+
 
 class LanguageTests(unittest.TestCase):
     def setUp(self):
         bridge.system_language.cache_clear()
         self.addCleanup(bridge.system_language.cache_clear)
+
+    def test_windows_ui_language_overrides_terminal(self):
+        with patch('bridge.sys.platform', 'win32'), patch('bridge.windows_language', return_value='zh-Hant-TW'), patch.dict(os.environ, {'LANG': 'ja_JP'}):
+            self.assertEqual(bridge.system_language(), 'zh-Hant')
 
     def test_language_variants(self):
         for value, expected in [('zh-Hans-JP', 'zh-Hans'), ('zh-Hant-CN', 'zh-Hant'),
@@ -239,6 +323,7 @@ class LanguageTests(unittest.TestCase):
                 self.assertEqual(bridge.system_language(), expected)
                 run.assert_not_called()
 
+    @patch('bridge.sys.platform', 'darwin')
     def test_dialog_language_and_machine_decisions(self):
         for language, labels, phrase in [('en', ['Deny', 'Allow this request'], 'no permanent allowlist'),
                                          ('zh-Hans', ['拒绝', '允许本次请求'], '不创建永久白名单'),

@@ -1,4 +1,5 @@
 import json
+import os
 import io
 from contextlib import redirect_stdout, redirect_stderr
 from unittest.mock import patch
@@ -14,6 +15,10 @@ import install
 
 class InstallTests(unittest.TestCase):
     def setUp(self):
+        environment = patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        os.environ.pop('CODEX_HOME', None)
         language = patch("bridge.system_language", return_value="en")
         language.start()
         self.addCleanup(language.stop)
@@ -43,7 +48,7 @@ class InstallTests(unittest.TestCase):
         return install.configure(self.home, project_dir=self.project, **kwargs)
 
     def read(self):
-        return json.loads(self.config.read_text())
+        return json.loads(self.config.read_text(encoding='utf-8'))
 
     def test_discovery_and_missing_runtime(self):
         self.assertEqual(install.discover(self.home)[0], self.definition)
@@ -55,14 +60,16 @@ class InstallTests(unittest.TestCase):
     def test_preserves_config_permissions_and_backs_up(self):
         original = {'mcpServers': {'other': {'command': 'other'}}, 'secret': 'preserve', 'projects': {'x': {}}}
         self.config.write_text(json.dumps(original))
-        self.config.chmod(0o640)
+        if os.name != 'nt':
+            self.config.chmod(0o640)
         plan = self.run_install()
         result = self.read()
         self.assertEqual(result['secret'], original['secret'])
         self.assertEqual(result['projects'], original['projects'])
         self.assertEqual(result['mcpServers']['other'], original['mcpServers']['other'])
-        self.assertEqual(json.loads(Path(plan['backup']).read_text()), original)
-        self.assertEqual(stat.S_IMODE(self.config.stat().st_mode), 0o640)
+        self.assertEqual(json.loads(Path(plan['backup']).read_text(encoding='utf-8')), original)
+        if os.name != 'nt':
+            self.assertEqual(stat.S_IMODE(self.config.stat().st_mode), 0o640)
         env = result['mcpServers']['cua_repl']['env']
         self.assertEqual(env['CUA_BRIDGE_AUTO_APPROVE_APPS'], '0')
         self.assertEqual(env['PRESERVED_VALUE'], 'do not print this')
@@ -108,6 +115,64 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(install.managed_path(self.home).exists())
         self.assertEqual(self.run_install(uninstall=True)['action'], 'nothing to uninstall')
 
+
+    def test_windows_manifest_without_mac_helper_preserves_native_pipe(self):
+        definition = json.loads(self.definition.read_text(encoding='utf-8'))
+        runtime = definition['mcpServers']['cua_repl']
+        runtime['env'].pop('SKY_CUA_SERVICE_PATH')
+        runtime['env']['SKY_CUA_NATIVE_PIPE'] = '1'
+        runtime['env']['SKY_CUA_NATIVE_PIPE_DIRECTORY'] = str(self.home / 'native-pipe')
+        runtime['args'].insert(0, '--no-warnings')
+        self.definition.write_text(json.dumps(definition), encoding='utf-8')
+        with patch('install.sys.platform', 'win32'):
+            self.run_install()
+            installed = self.read()['mcpServers']['cua_repl']
+            self.assertEqual(installed['args'][3:], runtime['args'])
+            for key in ('SKY_CUA_NATIVE_PIPE', 'SKY_CUA_NATIVE_PIPE_DIRECTORY'):
+                self.assertEqual(installed['env'][key], runtime['env'][key])
+            self.run_install(uninstall=True)
+        self.assertNotIn('cua_repl', self.read()['mcpServers'])
+
+    def test_mac_manifest_requires_helper(self):
+        definition = json.loads(self.definition.read_text(encoding='utf-8'))
+        definition['mcpServers']['cua_repl']['env'].pop('SKY_CUA_SERVICE_PATH')
+        self.definition.write_text(json.dumps(definition), encoding='utf-8')
+        with patch('install.sys.platform', 'darwin'), self.assertRaises(install.RuntimeNotFoundError):
+            install.discover(self.home)
+
+    def test_python_exe_owned_and_other_commands_rejected(self):
+        server = {'command': str(self.home / 'python.exe'),
+                  'args': ['-B', str(install.managed_path(self.home)), 'node', 'runtime']}
+        self.assertTrue(install.owned(server, self.home))
+        server['command'] = str(self.home / 'Python3.14.EXE')
+        self.assertTrue(install.owned(server, self.home))
+        server['command'] = str(self.home / 'unrelated.exe')
+        self.assertFalse(install.owned(server, self.home))
+
+    def test_codex_home_override(self):
+        alternate = self.home / 'alternate-codex'
+        (self.home / '.codex').rename(alternate)
+        with patch.dict(os.environ, {'CODEX_HOME': str(alternate)}):
+            source, _ = install.discover(self.home)
+        self.assertEqual(source, alternate / self.definition.relative_to(self.home / '.codex'))
+
+    def test_unicode_configuration_roundtrip(self):
+        original = {'language': '简体中文', 'projects': {'工作项目': {'name': '日本語'}}}
+        self.config.write_text(json.dumps(original, ensure_ascii=False), encoding='utf-8')
+        self.run_install()
+        self.assertEqual(self.read()['projects'], original['projects'])
+        self.run_install(uninstall=True)
+        self.assertEqual(self.read(), {**original, 'mcpServers': {}})
+
+    def test_windows_cli_supported_and_missing_runtime_explained(self):
+        errors = io.StringIO()
+        with patch.object(sys, 'argv', ['install.py']), patch('install.sys.platform', 'win32'), patch('install.Path.home', return_value=self.home), redirect_stderr(errors), redirect_stdout(io.StringIO()):
+            self.assertEqual(install.main(), 0)
+        (self.runtime / 'node').unlink()
+        errors = io.StringIO()
+        with patch.object(sys, 'argv', ['install.py']), patch('install.sys.platform', 'win32'), patch('install.Path.home', return_value=self.home), redirect_stderr(errors):
+            self.assertEqual(install.main(), 1)
+        self.assertIn('No usable Codex computer-use runtime', errors.getvalue())
 
     def test_cli_localization_preserves_machine_json_and_hides_config_errors(self):
         cases = [('en', 'Show the plan', 'Plan prepared.', 'Installation failed'),
