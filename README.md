@@ -4,8 +4,6 @@
 
 **Claude's Computer Use sucks? Use Codex's instead.**
 
-**嫌 Claude 自带的 Computer Use 太垃圾？换成 Codex 的。**
-
 Keep chatting with Claude. Let Codex's computer-use tools read the screen, click, and type in your Mac apps. This project connects Claude Code to the computer-use runtime already installed by Codex, including in local Code sessions in Claude Desktop.
 
 - **Same Claude, different tools:** Claude still decides what to do; Codex's runtime operates the apps.

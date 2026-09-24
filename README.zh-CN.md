@@ -4,8 +4,6 @@
 
 **嫌 Claude 自带的 Computer Use 太垃圾？换成 Codex 的。**
 
-**Claude's Computer Use sucks? Use Codex's instead.**
-
 你继续跟 Claude 聊天，让它用 Codex 的电脑操作工具查看屏幕、点击和输入。这个项目把本机 Codex 已安装的工具接给 Claude Code，也支持 Claude Desktop 里的本地 Code 会话。
 
 - **还是 Claude，只换操作工具：** Claude 负责理解任务和决定操作，Codex 的 runtime 负责操作应用。
