@@ -1,10 +1,18 @@
-# Claude Codex Computer Use
+# Claude + Codex Computer Use
 
 [简体中文](README.zh-CN.md)
 
-Use the computer-use runtime already installed by Codex from Claude Code on macOS.
+**Claude's Computer Use sucks? Use Codex's instead.**
 
-This unofficial MCP bridge forwards tools to Codex's `cua_repl` runtime and handles its native-app access requests. It can show a macOS approval dialog or automatically grant app access when you explicitly enable that mode.
+**嫌 Claude 自带的 Computer Use 太垃圾？换成 Codex 的。**
+
+Keep chatting with Claude. Let Codex's computer-use tools read the screen, click, and type in your Mac apps. This project connects Claude Code to the computer-use runtime already installed by Codex, including in local Code sessions in Claude Desktop.
+
+- **Same Claude, different tools:** Claude still decides what to do; Codex's runtime operates the apps.
+- **Choose how to approve app access:** show a confirmation dialog, or explicitly enable automatic access to all apps.
+- **macOS only:** requires a working Codex computer-use installation. Codex-specific browser automation is not included.
+
+Under the hood, this unofficial MCP bridge forwards calls to `cua_repl` and handles its app-access requests.
 
 **This repository contains only the bridge and installer.** It does not distribute OpenAI binaries, provide a standalone computer-use engine, or replace Claude's model.
 

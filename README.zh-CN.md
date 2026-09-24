@@ -1,10 +1,18 @@
-# Claude Codex Computer Use
+# Claude + Codex Computer Use
 
 [English](README.md)
 
-让 macOS 上的 Claude Code 使用本机 Codex 已安装的 computer use runtime。
+**嫌 Claude 自带的 Computer Use 太垃圾？换成 Codex 的。**
 
-这是一个非官方 MCP 适配器：把工具调用交给 Codex 的 `cua_repl`，并处理应用访问授权。默认弹出 macOS 确认框，也可以显式开启所有应用访问自动允许。
+**Claude's Computer Use sucks? Use Codex's instead.**
+
+你继续跟 Claude 聊天，让它用 Codex 的电脑操作工具查看屏幕、点击和输入。这个项目把本机 Codex 已安装的工具接给 Claude Code，也支持 Claude Desktop 里的本地 Code 会话。
+
+- **还是 Claude，只换操作工具：** Claude 负责理解任务和决定操作，Codex 的 runtime 负责操作应用。
+- **应用授权方式自己选：** 默认弹窗确认，也可以主动开启所有应用自动允许。
+- **目前只支持 macOS：** 需要本机 Codex 的 computer use 已能正常使用，不包含 Codex 专用浏览器自动化。
+
+它的实现是一个非官方 MCP 适配器，负责转发 `cua_repl` 工具调用和处理应用访问授权。
 
 **项目只包含适配器和安装程序，不分发 OpenAI 的二进制文件。** 它不能独立提供 computer use，也不会把 Claude 的模型换成 Codex。
 
