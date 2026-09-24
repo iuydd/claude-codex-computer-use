@@ -40,7 +40,9 @@ If you want this bridge to replace Claude Desktop's built-in computer use, turn 
 
 ## Approval modes
 
-By default, a matching app-access request opens a native dialog titled **Claude · Codex Computer Use**. Choose `允许本次请求` (Allow this request) or `拒绝` (Deny). The dialog times out after 20 seconds and denies the request. It does not create a permanent allowlist.
+By default, a matching app-access request opens a native dialog titled **Claude · Codex Computer Use**. Choose **Allow this request** or **Deny** in your system language. The dialog times out after 20 seconds and denies the request. It does not create a permanent allowlist.
+
+The bridge's dialog and installer messages follow the first preferred language in macOS Language & Region: English, Simplified Chinese, Traditional Chinese, or Japanese. Other languages fall back to English. If the system preference cannot be read, the locale environment is used. Restart the Claude Code session after changing your system language. Original runtime request text, technical logs, JSON keys, and argparse's built-in usage/error labels remain untranslated.
 
 To explicitly allow access to every app without these dialogs:
 

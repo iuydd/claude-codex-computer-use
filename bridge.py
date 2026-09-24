@@ -2,6 +2,8 @@
 """Relay MCP, rendering narrowly identified native-app approvals for a human."""
 import concurrent.futures
 import json
+from functools import lru_cache
+import plistlib
 import os
 import re
 import select
@@ -10,12 +12,45 @@ import subprocess
 import sys
 import threading
 import time
+from xml.parsers.expat import ExpatError
+
+
+def normalize_language(value):
+    parts = value.split('.')[0].split('@')[0].replace('_', '-').lower().split('-')
+    if parts[0] == 'zh':
+        if 'hant' in parts or ('hans' not in parts and any(p in parts for p in ('tw', 'hk', 'mo'))):
+            return 'zh-Hant'
+        return 'zh-Hans'
+    return 'ja' if parts[0] == 'ja' else 'en'
+
+
+@lru_cache(maxsize=1)
+def system_language():
+    # GUI preferences take precedence: terminal LANG often differs from the desktop.
+    if sys.platform == 'darwin':
+        try:
+            result = subprocess.run(['/usr/bin/defaults', 'export', '-g', '-'],
+                                    capture_output=True, timeout=2, check=True)
+            languages = plistlib.loads(result.stdout).get('AppleLanguages')
+            if isinstance(languages, list) and languages and isinstance(languages[0], str) and languages[0].strip():
+                return normalize_language(languages[0])
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError, AttributeError, ExpatError):
+            pass
+    value = next((os.environ[key] for key in ('LC_ALL', 'LC_MESSAGES', 'LANG') if os.environ.get(key)), 'en')
+    return normalize_language(value)
+
+
+def tr(en, hans, hant, ja):
+    return {'en': en, 'zh-Hans': hans, 'zh-Hant': hant, 'ja': ja}[system_language()]
 
 
 DIALOG = '''on run argv
-set resultValue to display dialog (item 1 of argv) with title "Claude · Codex Computer Use" buttons {"拒绝", "允许本次请求"} default button "拒绝" cancel button "拒绝" giving up after 20
+set denyLabel to item 2 of argv
+set allowLabel to item 3 of argv
+set resultValue to display dialog (item 1 of argv) with title "Claude · Codex Computer Use" buttons {denyLabel, allowLabel} default button denyLabel cancel button denyLabel giving up after 20
 if gave up of resultValue then return "timeout"
-return button returned of resultValue
+if button returned of resultValue is allowLabel then return "allow"
+return "deny"
 end run'''
 
 
@@ -47,11 +82,12 @@ def approval_text(request):
     subtitle = meta.get('subtitle', '')
     if not isinstance(subtitle, str) or len(subtitle) > 4096:
         return None
-    return (f'Claude 请求通过 Codex Computer Use 访问应用。\n\n'
-            f'应用：{app}\n请求动作：{action}\n\n{message}\n{subtitle}\n\n'
-            '仅批准本次权限请求，不创建永久白名单。\n'
-            '底层服务可能在当前会话内保留此应用授权。\n'
-            '如果你没有发起这项操作，请选择拒绝。')
+    return tr(
+        'Claude requests access to an app through Codex Computer Use.\n\nApp: {app}\nAction: {action}\n\nOriginal request:\n"{message}"\n"{subtitle}"\n\nApprove only this request; no permanent allowlist is created.\nThe underlying service may retain app access for this session.\nChoose Deny if you did not initiate this action.',
+        'Claude 请求通过 Codex Computer Use 访问应用。\n\n应用：{app}\n请求动作：{action}\n\n原始请求：\n“{message}”\n“{subtitle}”\n\n仅批准本次权限请求，不创建永久白名单。\n底层服务可能在当前会话内保留此应用授权。\n如果你没有发起这项操作，请选择拒绝。',
+        'Claude 請求透過 Codex Computer Use 存取應用程式。\n\n應用程式：{app}\n請求動作：{action}\n\n原始請求：\n「{message}」\n「{subtitle}」\n\n僅核准本次權限請求，不建立永久允許清單。\n底層服務可能在目前工作階段內保留此應用程式授權。\n如果你沒有發起這項操作，請選擇拒絕。',
+        'Claude が Codex Computer Use を通じてアプリへのアクセスを要求しています。\n\nアプリ：{app}\n操作：{action}\n\n元のリクエスト：\n「{message}」\n「{subtitle}」\n\n今回のリクエストのみを許可し、永続的な許可リストは作成しません。\n基盤サービスは、このセッション中アプリの許可を保持する場合があります。\nこの操作を開始していない場合は「拒否」を選んでください。'
+    ).format(app=app, action=action, message=message, subtitle=subtitle)
 
 
 def prompt_user(message, stopped, runner=subprocess.Popen):
@@ -59,14 +95,16 @@ def prompt_user(message, stopped, runner=subprocess.Popen):
     started = time.monotonic()
     print("[cua-bridge] approval dialog opened", file=sys.stderr, flush=True)
     try:
-        process = runner(['/usr/bin/osascript', '-e', DIALOG, '--', message],
+        process = runner(['/usr/bin/osascript', '-e', DIALOG, '--', message,
+                          tr('Deny', '拒绝', '拒絕', '拒否'),
+                          tr('Allow this request', '允许本次请求', '允許本次請求', '今回のみ許可')],
                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         for _ in range(230):
             if stopped.is_set():
                 return False
             try:
                 output, _ = process.communicate(timeout=0.1)
-                accepted = process.returncode == 0 and output.strip() == '允许本次请求'
+                accepted = process.returncode == 0 and output.strip() == 'allow'
                 print(f'[cua-bridge] dialog result={output.strip()!r} exit={process.returncode} elapsed={time.monotonic()-started:.1f}s accepted={accepted}', file=sys.stderr, flush=True)
                 return accepted
             except subprocess.TimeoutExpired:
